@@ -15,18 +15,18 @@
 package simplepassword
 
 import (
-	"crypto/sha256"
-	"crypto/subtle"
-	"encoding/hex"
+	"encoding/base64"
 	"fmt"
 	"html/template"
+	"log"
 	"net/http"
 	"time"
 
-	"go.uber.org/zap"
-
+	"github.com/alexedwards/argon2id"
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/golang-jwt/jwt/v5"
+	"go.uber.org/zap"
 )
 
 // simplePassword is a Caddy HTTP handler module that adds simple password authentication
@@ -42,11 +42,14 @@ type simplePassword struct {
 	// like {env.PASSWORD} or {file./path/to/password.txt}.
 	Password string `json:"password,omitempty"`
 
+	// base64 encoded 256 bit signing key
+	SigningKey string `json:"signingkey,omitempty"`
+
 	// password is the resolved password after placeholder replacement.
 	password string
 
-	// passwordHash is hex(SHA256(password)), computed once in Provision.
-	passwordHash string
+	// Resolved key after decode
+	signingKey []byte
 
 	// CookieName defines the name of the cookie used to store the session token.
 	// Default is `sp_sess`.
@@ -96,9 +99,12 @@ func (m *simplePassword) Provision(ctx caddy.Context) error {
 	// Replace placeholders in the password such as {env.PASSWORD}
 	m.password = repl.ReplaceAll(m.Password, "")
 
-	// Compute password hash for cookie value
-	h := sha256.Sum256([]byte(m.password))
-	m.passwordHash = hex.EncodeToString(h[:])
+	signingKey, err := base64.StdEncoding.DecodeString(m.SigningKey)
+	if err != nil {
+
+	}
+
+	m.signingKey = signingKey
 
 	// Provision the HTML template
 	if err := m.provisionTemplate(); err != nil {
@@ -128,6 +134,10 @@ func (m *simplePassword) Validate() error {
 	return nil
 }
 
+type CustomClaims struct {
+	jwt.RegisteredClaims
+}
+
 // ServeHTTP handles incoming HTTP requests, checking for a valid session or prompting for a password.
 func (m *simplePassword) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	repl, ok := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
@@ -138,18 +148,19 @@ func (m *simplePassword) ServeHTTP(w http.ResponseWriter, r *http.Request, next 
 
 	// Check for valid session cookie; refresh on every request (sliding session)
 	if cookie, err := r.Cookie(m.CookieName); err == nil {
-		if subtle.ConstantTimeCompare([]byte(cookie.Value), []byte(m.passwordHash)) == 1 {
-			http.SetCookie(w, &http.Cookie{
-				Name:     m.CookieName,
-				Value:    m.passwordHash,
-				Path:     m.CookiePath,
-				Domain:   m.CookieDomain,
-				MaxAge:   int(m.SessionInactivityTimeout.Seconds()),
-				HttpOnly: true,
-				Secure:   true,
-				SameSite: http.SameSiteStrictMode,
-			})
-			return next.ServeHTTP(w, r)
+		tokenStr := cookie.Value
+		claims := &CustomClaims{}
+
+		token, err := jwt.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (interface{}, error) {
+			// Enforce validation of the specific cryptographic family
+			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+			}
+			return m.signingKey, nil
+		})
+
+		if err == nil || token.Valid {
+			next.ServeHTTP(w, r)
 		}
 	}
 
@@ -176,7 +187,13 @@ func (m *simplePassword) ServeHTTP(w http.ResponseWriter, r *http.Request, next 
 	}
 
 	// Constant-time comparison to prevent timing attacks
-	if subtle.ConstantTimeCompare([]byte(submittedPassword), []byte(m.password)) != 1 {
+	match, err := argon2id.ComparePasswordAndHash(submittedPassword, m.password)
+	if err != nil {
+		log.Fatal(err)
+		http.Error(w, "Failed to hash", http.StatusInternalServerError)
+	}
+
+	if !match {
 		m.logger.Warn("Invalid password attempt",
 			zap.String("client_ip", repl.ReplaceAll("{http.request.remote.host}", "")),
 		)
@@ -185,13 +202,28 @@ func (m *simplePassword) ServeHTTP(w http.ResponseWriter, r *http.Request, next 
 		return nil
 	}
 
+	expirationTime := time.Now().Add(24 * time.Hour)
+	claims := &CustomClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(expirationTime),
+		},
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+
+	tokenString, err := token.SignedString(m.signingKey)
+	if err != nil {
+		log.Fatal(err)
+		http.Error(w, "Failed to sign", http.StatusInternalServerError)
+	}
+
 	// Set session cookie on successful authentication.
 	http.SetCookie(w, &http.Cookie{
 		Name:     m.CookieName,
-		Value:    m.passwordHash,
+		Value:    tokenString,
 		Path:     m.CookiePath,
 		Domain:   m.CookieDomain,
-		MaxAge:   int(m.SessionInactivityTimeout.Seconds()),
+		Expires:  expirationTime,
 		HttpOnly: true,
 		Secure:   true,
 		SameSite: http.SameSiteStrictMode,
