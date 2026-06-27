@@ -160,7 +160,7 @@ func (m *simplePassword) ServeHTTP(w http.ResponseWriter, r *http.Request, next 
 		})
 
 		if err == nil || token.Valid {
-			next.ServeHTTP(w, r)
+			return next.ServeHTTP(w, r)
 		}
 	}
 
