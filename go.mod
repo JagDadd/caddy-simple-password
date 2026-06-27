@@ -1,4 +1,4 @@
-module github.com/xupefei/caddy-simple-password
+module github.com/JagDadd/caddy-simple-password
 
 go 1.25.1
 
