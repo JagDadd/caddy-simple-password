@@ -61,6 +61,8 @@ func (m *simplePassword) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				m.FormTemplateFile = arg
 			case "password":
 				m.Password = arg
+			case "signingkey":
+				m.SigningKey = arg
 			case "session_inactivity_timeout":
 				duration, err := time.ParseDuration(arg)
 				if err != nil {
