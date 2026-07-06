@@ -15,6 +15,7 @@
 package simplepassword
 
 import (
+	"crypto/rand"
 	"encoding/base64"
 	"fmt"
 	"html/template"
@@ -206,6 +207,7 @@ func (m *simplePassword) ServeHTTP(w http.ResponseWriter, r *http.Request, next 
 	claims := &CustomClaims{
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(expirationTime),
+			ID:        rand.Text(),
 		},
 	}
 
